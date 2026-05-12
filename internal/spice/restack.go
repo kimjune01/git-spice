@@ -13,6 +13,21 @@ import (
 // on top of its base.
 var ErrAlreadyRestacked = errors.New("branch is already restacked")
 
+// BranchMergedError indicates that a branch has been merged
+// into its base branch and no longer needs restacking.
+type BranchMergedError struct {
+	// Branch is the name of the merged branch.
+	Branch string
+
+	// Base is the name of the base branch
+	// that the branch was merged into.
+	Base string
+}
+
+func (e *BranchMergedError) Error() string {
+	return fmt.Sprintf("branch %v has been merged into %v", e.Branch, e.Base)
+}
+
 // RestackResponse is the response to a restack operation.
 type RestackResponse struct {
 	Base string
@@ -40,9 +55,18 @@ func (s *Service) Restack(ctx context.Context, name string) (*RestackResponse, e
 	}
 
 	// The branch needs to be restacked on top of its base branch.
-	// We will proceed with the restack.
-
+	// Before proceeding, check if the branch has already been merged
+	// into its base. If so, restacking is unnecessary and would
+	// replay already-merged commits.
 	baseHash := restackErr.BaseHash
+	if s.repo.IsAncestor(ctx, b.Head, baseHash) {
+		return nil, &BranchMergedError{
+			Branch: name,
+			Base:   b.Base,
+		}
+	}
+
+	// We will proceed with the restack.
 	upstream := b.BaseHash
 
 	// Case:

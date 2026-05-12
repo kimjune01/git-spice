@@ -218,6 +218,12 @@ loop:
 				continue loop
 
 			default:
+				var mergedErr *spice.BranchMergedError
+				if errors.As(err, &mergedErr) {
+					h.Log.Warnf("%v: branch appears to have been merged into %v.", branch, mergedErr.Base)
+					h.Log.Warnf("Run '%s repo sync' to clean up merged branches.", cli.Name())
+					continue loop
+				}
 				return 0, fmt.Errorf("restack branch %q: %w", branch, err)
 			}
 		}

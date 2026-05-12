@@ -1,0 +1,47 @@
+# If a branch has been merged into its base,
+# restack should detect this and skip it
+# instead of attempting to rebase already-merged commits.
+#
+# Regression test for https://github.com/abhinav/git-spice/issues/314
+
+as 'Test <test@example.com>'
+at '2024-03-30T14:59:32Z'
+
+mkdir repo
+cd repo
+git init
+git commit --allow-empty -m 'Initial commit'
+gs repo init
+
+# Set up a stack: main -> feat1 -> feat2
+git add feat1.txt
+gs bc feat1 -m 'Add feat1'
+
+git add feat2.txt
+gs bc feat2 -m 'Add feat2'
+
+# Simulate a non-fast-forward merge of feat1 into main
+# (like a GitHub "merge commit" merge).
+# First make a change on main so it can't fast-forward.
+gs bco main
+cp $WORK/extra/main-change.txt .
+git add main-change.txt
+git commit -m 'Independent main commit'
+
+# Now merge feat1 into main with a merge commit.
+git merge feat1 --no-edit
+
+# Go to feat2 and restack the stack.
+git checkout feat2
+gs stack restack
+stderr 'feat1: branch appears to have been merged into main'
+stderr 'repo sync'
+
+-- repo/feat1.txt --
+contents of feat1
+
+-- repo/feat2.txt --
+contents of feat2
+
+-- extra/main-change.txt --
+independent change on main
