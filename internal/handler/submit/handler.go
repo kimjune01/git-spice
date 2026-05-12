@@ -1062,6 +1062,32 @@ func (h *Handler) submitBranch(
 			return status, nil
 		}
 
+		// Update CR metadata (base, draft, labels, etc.) before pushing
+		// to avoid generating multiple webhook events.
+		// Changing the base via API triggers an "edited" event,
+		// while pushing triggers a "synchronize" event.
+		// By editing first, the push produces a single "synchronize"
+		// event with the already-correct base.
+		if len(updates) > 0 {
+			editOpts := forge.EditChangeOptions{
+				Base:         upstreamBase,
+				Draft:        opts.Draft,
+				AddLabels:    opts.Labels,
+				AddReviewers: reviewers,
+				AddAssignees: opts.Assignees,
+			}
+
+			// remoteRepo is guaranteed to be available at this point.
+			remoteRepo, err := h.upstreamRepository(ctx)
+			if err != nil {
+				return status, fmt.Errorf("edit CR %v: %w", pull.ID, err)
+			}
+
+			if err := remoteRepo.EditChange(ctx, pull.ID, editOpts); err != nil {
+				return status, fmt.Errorf("edit CR %v: %w", pull.ID, err)
+			}
+		}
+
 		if pull.HeadHash != commitHash {
 			pushOpts := git.PushOptions{
 				Remote: remote.Push,
@@ -1083,26 +1109,6 @@ func (h *Handler) submitBranch(
 			if err := h.Worktree.Push(ctx, pushOpts); err != nil {
 				log.Error("Push failed. Branch may have been updated by someone else. Try with --force.")
 				return status, fmt.Errorf("push branch: %w", err)
-			}
-		}
-
-		if len(updates) > 0 {
-			editOpts := forge.EditChangeOptions{
-				Base:         upstreamBase,
-				Draft:        opts.Draft,
-				AddLabels:    opts.Labels,
-				AddReviewers: reviewers,
-				AddAssignees: opts.Assignees,
-			}
-
-			// remoteRepo is guaranteed to be available at this point.
-			remoteRepo, err := h.upstreamRepository(ctx)
-			if err != nil {
-				return status, fmt.Errorf("edit CR %v: %w", pull.ID, err)
-			}
-
-			if err := remoteRepo.EditChange(ctx, pull.ID, editOpts); err != nil {
-				return status, fmt.Errorf("edit CR %v: %w", pull.ID, err)
 			}
 		}
 
