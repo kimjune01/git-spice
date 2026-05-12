@@ -18,33 +18,43 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
-func TestIndexLockObserver_Seen(t *testing.T) {
-	t.Run("ExactMatch", func(t *testing.T) {
-		observer := new(indexLockObserver)
+func TestLockObserver_Seen(t *testing.T) {
+	t.Run("ExactMatch/IndexLock", func(t *testing.T) {
+		observer := new(lockObserver)
 
 		_, err := observer.Write([]byte("index.lock"))
 		require.NoError(t, err)
 		assert.True(t, observer.Seen())
 	})
 
+	t.Run("ExactMatch/HEADLock", func(t *testing.T) {
+		observer := new(lockObserver)
+
+		_, err := observer.Write([]byte("HEAD.lock"))
+		require.NoError(t, err)
+		assert.True(t, observer.Seen())
+	})
+
 	t.Run("AcrossWriteBoundaries", func(t *testing.T) {
-		for i := 1; i < len(_indexLockToken); i++ {
-			t.Run(_indexLockToken[:i]+"|"+_indexLockToken[i:], func(t *testing.T) {
-				observer := new(indexLockObserver)
+		for _, token := range _lockTokens {
+			for i := 1; i < len(token); i++ {
+				t.Run(token[:i]+"|"+token[i:], func(t *testing.T) {
+					observer := new(lockObserver)
 
-				_, err := observer.Write([]byte(_indexLockToken[:i]))
-				require.NoError(t, err)
-				assert.False(t, observer.Seen())
+					_, err := observer.Write([]byte(token[:i]))
+					require.NoError(t, err)
+					assert.False(t, observer.Seen())
 
-				_, err = observer.Write([]byte(_indexLockToken[i:]))
-				require.NoError(t, err)
-				assert.True(t, observer.Seen())
-			})
+					_, err = observer.Write([]byte(token[i:]))
+					require.NoError(t, err)
+					assert.True(t, observer.Seen())
+				})
+			}
 		}
 	})
 
 	t.Run("MismatchResetsPartialMatch", func(t *testing.T) {
-		observer := new(indexLockObserver)
+		observer := new(lockObserver)
 
 		_, err := observer.Write([]byte("indexXlock"))
 		require.NoError(t, err)
@@ -56,7 +66,7 @@ func TestIndexLockObserver_Seen(t *testing.T) {
 	})
 
 	t.Run("MatchStaysLatched", func(t *testing.T) {
-		observer := new(indexLockObserver)
+		observer := new(lockObserver)
 
 		_, err := observer.Write([]byte("index.lock trailing text"))
 		require.NoError(t, err)
@@ -65,6 +75,26 @@ func TestIndexLockObserver_Seen(t *testing.T) {
 		_, err = observer.Write([]byte(" more bytes"))
 		require.NoError(t, err)
 		assert.True(t, observer.Seen())
+	})
+
+	t.Run("HEADLockInGitError", func(t *testing.T) {
+		observer := new(lockObserver)
+
+		// Real git error message from issue #659
+		msg := "error: update_ref failed for ref 'HEAD': " +
+			"cannot lock ref 'HEAD': " +
+			"Unable to create '.git/HEAD.lock': File exists."
+		_, err := observer.Write([]byte(msg))
+		require.NoError(t, err)
+		assert.True(t, observer.Seen())
+	})
+
+	t.Run("NoMatch", func(t *testing.T) {
+		observer := new(lockObserver)
+
+		_, err := observer.Write([]byte("fatal: unrelated error"))
+		require.NoError(t, err)
+		assert.False(t, observer.Seen())
 	})
 }
 
@@ -93,7 +123,7 @@ func TestWorktree_runGitWithIndexLockRetry(t *testing.T) {
 		assert.Equal(t, 1, builds)
 	})
 
-	t.Run("RetryableFailureRebuildsCommand", func(t *testing.T) {
+	t.Run("RetryableFailureRebuildsCommand/IndexLock", func(t *testing.T) {
 		mockExecer := NewMockExecer(gomock.NewController(t))
 		_, wt := newFakeRepositoryWithCommonOptions(t, "", commonOptions{
 			exec:             mockExecer,
@@ -106,6 +136,37 @@ func TestWorktree_runGitWithIndexLockRetry(t *testing.T) {
 			DoAndReturn(func(cmd *exec.Cmd) error {
 				if builds < 3 {
 					_, _ = io.WriteString(cmd.Stderr, "fatal: index.lock\n")
+					return &exec.ExitError{}
+				}
+				return nil
+			}).
+			Times(3)
+
+		err := wt.runGitWithIndexLockRetry(t.Context(), func() *gitCmd {
+			builds++
+			return wt.gitCmd(t.Context(), "status")
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, 3, builds)
+	})
+
+	t.Run("RetryableFailureRebuildsCommand/HEADLock", func(t *testing.T) {
+		mockExecer := NewMockExecer(gomock.NewController(t))
+		_, wt := newFakeRepositoryWithCommonOptions(t, "", commonOptions{
+			exec:             mockExecer,
+			indexLockTimeout: time.Second,
+		})
+
+		builds := 0
+		mockExecer.EXPECT().
+			Run(gomock.Any()).
+			DoAndReturn(func(cmd *exec.Cmd) error {
+				if builds < 3 {
+					_, _ = io.WriteString(cmd.Stderr,
+						"error: update_ref failed for ref 'HEAD': "+
+							"cannot lock ref 'HEAD': "+
+							"Unable to create '.git/HEAD.lock': File exists.\n")
 					return &exec.ExitError{}
 				}
 				return nil
@@ -273,13 +334,61 @@ func TestWorktree_runGitWithIndexLockRetry(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Contains(t, logBuffer.String(),
-			"Retrying Git command after index.lock contention")
+			"Retrying Git command after lock contention")
 		assert.Contains(t, logBuffer.String(), "attempt=1")
 	})
 }
 
-func TestObserveIndexLock(t *testing.T) {
-	t.Run("ObserverAttachedViaTeeStderr", func(t *testing.T) {
+func TestObserveLock(t *testing.T) {
+	t.Run("IndexLock/ObserverAttachedViaTeeStderr", func(t *testing.T) {
+		cmd := &gitCmd{
+			cmd: xec.Command(
+				t.Context(),
+				silog.Nop(),
+				"sh",
+				"-c",
+				"echo 'fatal: index.lock' >&2; exit 1",
+			),
+			log: silog.Nop(),
+		}
+		observer := cmd.ObserveLock()
+
+		err := cmd.Run()
+		require.Error(t, err)
+		assert.True(t, observer.Seen())
+		assert.True(t, observer.IsLockErr(err))
+	})
+
+	t.Run("HEADLock/ObserverAttachedViaTeeStderr", func(t *testing.T) {
+		cmd := &gitCmd{
+			cmd: xec.Command(
+				t.Context(),
+				silog.Nop(),
+				"sh",
+				"-c",
+				"echo 'Unable to create HEAD.lock' >&2; exit 1",
+			),
+			log: silog.Nop(),
+		}
+		observer := cmd.ObserveLock()
+
+		err := cmd.Run()
+		require.Error(t, err)
+		assert.True(t, observer.Seen())
+		assert.True(t, observer.IsLockErr(err))
+	})
+
+	t.Run("RequiresObservedLockAndNonZeroExit", func(t *testing.T) {
+		observer := new(lockObserver)
+		_, err := observer.Write([]byte("fatal: unable to create index.lock"))
+		require.NoError(t, err)
+
+		assert.False(t, observer.IsLockErr(nil))
+		assert.True(t, observer.IsLockErr(&exec.ExitError{}))
+		assert.False(t, new(lockObserver).IsLockErr(&exec.ExitError{}))
+	})
+
+	t.Run("BackwardCompat/ObserveIndexLock", func(t *testing.T) {
 		cmd := &gitCmd{
 			cmd: xec.Command(
 				t.Context(),
@@ -296,16 +405,6 @@ func TestObserveIndexLock(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, observer.Seen())
 		assert.True(t, observer.IsIndexLockErr(err))
-	})
-
-	t.Run("RequiresObservedIndexLockAndNonZeroExit", func(t *testing.T) {
-		observer := new(indexLockObserver)
-		_, err := observer.Write([]byte("fatal: unable to create index.lock"))
-		require.NoError(t, err)
-
-		assert.False(t, observer.IsIndexLockErr(nil))
-		assert.True(t, observer.IsIndexLockErr(&exec.ExitError{}))
-		assert.False(t, new(indexLockObserver).IsIndexLockErr(&exec.ExitError{}))
 	})
 }
 

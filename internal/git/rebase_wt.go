@@ -162,7 +162,10 @@ func (w *Worktree) Rebase(ctx context.Context, req RebaseRequest) (retErr error)
 		AdviceMergeConflict: new(false),
 	}
 
-	lockPath := filepath.Join(w.gitDir, "index.lock")
+	lockPaths := []string{
+		filepath.Join(w.gitDir, "index.lock"),
+		filepath.Join(w.gitDir, "HEAD.lock"),
+	}
 	var retrying bool
 
 	err := retry.Exponential{
@@ -170,17 +173,21 @@ func (w *Worktree) Rebase(ctx context.Context, req RebaseRequest) (retErr error)
 		Delay:   _indexLockRetryDelay,
 	}.Do(ctx, func(attempt retry.Attempt) error {
 		if retrying {
-			// When a rebase fails because another process holds index.lock,
+			// When a rebase fails because another process holds
+			// a lock (index.lock or HEAD.lock),
 			// Git may already have rescheduled the current pick and left
-			// rebase state behind. Wait for the lock to disappear before
+			// rebase state behind. Wait for locks to clear before
 			// trying to advance the rebase again.
-			if _, err := os.Stat(lockPath); err == nil {
-				w.log.Debug("Waiting for index.lock to clear",
-					"attempt", attempt.Number,
-				)
-				return errIndexLockHeld
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return retry.Fail(fmt.Errorf("stat %q: %w", lockPath, err))
+			for _, lockPath := range lockPaths {
+				if _, err := os.Stat(lockPath); err == nil {
+					w.log.Debug("Waiting for lock to clear",
+						"path", lockPath,
+						"attempt", attempt.Number,
+					)
+					return errIndexLockHeld
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return retry.Fail(fmt.Errorf("stat %q: %w", lockPath, err))
+				}
 			}
 		}
 
@@ -208,11 +215,11 @@ func (w *Worktree) Rebase(ctx context.Context, req RebaseRequest) (retErr error)
 				WithStderr(os.Stderr)
 		}
 
-		observer := cmd.ObserveIndexLock()
+		observer := cmd.ObserveLock()
 		if err := cmd.Run(); err != nil {
-			if observer.IsIndexLockErr(err) {
+			if observer.IsLockErr(err) {
 				retrying = true
-				w.log.Debug("Retrying Git command after index.lock contention",
+				w.log.Debug("Retrying rebase after lock contention",
 					"attempt", attempt.Number,
 					"error", err,
 				)
